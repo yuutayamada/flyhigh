@@ -3,6 +3,7 @@
 ;; Copyright (C) 2017  Yuta Yamada
 
 ;; Author: Yuta Yamada <cokesboy<at>gmail.com>
+;; Package-Requires: ((emacs "26.1") (dash "20170810"))
 ;; Keywords:
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -39,10 +40,12 @@
 ;; * Only apply specific range/lines in buffer.  This is important when your
 ;;   file is too too big.
 ;; * Discard highlight data if user started editing current query before apply
-;; * Tasks should be executed partially in the idle time.
+;; * The highlight should be executed partially in the idle time.
 ;; * Use `defmethod', so other people might use this library same way.
 ;; * What is the best way to apply highlight? Overlay?
-
+;; * cache the un-finished highlight and doesn't make a query if you
+;;   already have the highlight when user doesn't changed anything,
+;;   but cursor moved.
 ;;; Code:
 
 (require 'cl-lib)
@@ -51,6 +54,8 @@
 (require 'compile) ; for some faces
 ;; when-let*, if-let*, hash-table-keys, hash-table-values:
 (eval-when-compile (require 'subr-x))
+(require 'dash)
+(require 'deferred)
 
 (defgroup flyhigh nil
   "Universal on-the-fly syntax highlighter."
@@ -65,8 +70,20 @@
 If nil, never start checking buffer automatically like this."
   :type 'number)
 
-(defcustom flyhigh-offset 5
+(defcustom flyhigh-invisible-hl-timeout 1000
+  "Time to idle wait for invisible highlight by msec."
+  :type 'number)
+
+(defcustom flyhigh-highlight-interval 10
+  "Time to idle wait for group of highlight by msec."
+  :type 'number)
+
+(defcustom flyhigh-offset 0
   "Line offset; increase offset more highlight more display lock..."
+  :type 'number)
+
+(defcustom flyhigh-division 5
+  "wip"
   :type 'number)
 
 (defcustom flyhigh-start-on-flyhigh-mode t
@@ -85,6 +102,11 @@ Specifically, start it when the buffer is actually displayed."
   "Time at which syntax highlight was started.")
 
 (defvar-local flyhigh-window-bounds nil)
+
+(defun flyhigh-window-bounds-with-offset ()
+  "Return cons of (beg . end)."
+  (flyhigh--offset (flyhigh--line (window-start))
+                   (flyhigh--line (window-end))))
 
 (defun flyhigh--offset (start-line end-line)
   "Calculate START-LINE and END-LINE of offset."
@@ -148,8 +170,7 @@ generated it."
                                 end
                                 face)
   "Make a Flyhigh diagnostic for BUFFER's region from BEG to END.
-TYPE is a key to `flyhigh-diagnostic-types-alist' and TEXT is a
-description of the problem detected in this region."
+FACE is the face of the region."
   (flyhigh--diag-make :buffer buffer :beg beg :end end :face face))
 
 ;;;###autoload
@@ -200,29 +221,29 @@ verify FILTER, a function, and sort them by COMPARE (using KEY)."
   "Delete all Flyhigh overlays in BUFFER."
   (mapc #'delete-overlay (flyhigh--overlays :filter filter)))
 
-(defface flyhigh-error
-  '((((supports :underline (:style wave)))
-     :underline (:style wave :color "Red1"))
-    (t
-     :inherit error))
-  "Face used for marking error regions."
-  :version "24.4")
+;; (defface flyhigh-error
+;;   '((((supports :underline (:style wave)))
+;;      :underline (:style wave :color "Red1"))
+;;     (t
+;;      :inherit error))
+;;   "Face used for marking error regions."
+;;   :version "24.4")
 
-(defface flyhigh-warning
-  '((((supports :underline (:style wave)))
-     :underline (:style wave :color "deep sky blue"))
-    (t
-     :inherit warning))
-  "Face used for marking warning regions."
-  :version "24.4")
+;; (defface flyhigh-warning
+;;   '((((supports :underline (:style wave)))
+;;      :underline (:style wave :color "deep sky blue"))
+;;     (t
+;;      :inherit warning))
+;;   "Face used for marking warning regions."
+;;   :version "24.4")
 
-(defface flyhigh-note
-  '((((supports :underline (:style wave)))
-     :underline (:style wave :color "yellow green"))
-    (t
-     :inherit warning))
-  "Face used for marking note regions."
-  :version "26.1")
+;; (defface flyhigh-note
+;;   '((((supports :underline (:style wave)))
+;;      :underline (:style wave :color "yellow green"))
+;;     (t
+;;      :inherit warning))
+;;   "Face used for marking note regions."
+;;   :version "26.1")
 
 (defvar flyhigh-diagnostic-functions nil
   "Special hook of Flyhigh backends that check a buffer.
@@ -357,8 +378,7 @@ not expected."
   (let* ((state (gethash backend flyhigh--backend-state))
          (first-report (not (flyhigh--backend-state-reported-p state))))
     (setf (flyhigh--backend-state-reported-p state) t)
-    (let (expected-token
-          new-diags)
+    (let (expected-token)
       (cond
        ((null state)
         (flyhigh-error
@@ -381,42 +401,116 @@ not expected."
         (flyhigh--disable-backend backend
                                   (format "Unknown action %S" report-action))
         (flyhigh-error "Expected report, but got unknown key %s" report-action))
-       (t
+       (t (flyhigh--handle-report-1 report-action first-report backend state))))))
 
-        (setq new-diags report-action)
-        (save-restriction
-          (widen)
-
-          ;; only delete overlays if this is the first report
-          (when first-report
+(defun flyhigh--handle-report-1 (new-diags first-report backend state)
+  ""
+  ;; Trying to make pseudo async handler using `deferred' package.
+  (deferred:$
+    ;; TODO: remove some overlays from `new-diags' that already
+    ;; highlighted.
+    (deferred:next
+      ;; only delete overlays if this is the first report
+      (lambda ()
+        (when first-report
+          (save-restriction
+            (widen)
             (flyhigh-delete-own-overlays
              (lambda (ov)
-
                (eq backend
                    (flyhigh--diag-backend
-                    (overlay-get ov 'flyhigh-diagnostic))))))
+                    (overlay-get ov 'flyhigh-diagnostic)))))))))
 
-          (mapc (lambda (diag)
-                  (condition-case err
-                      (flyhigh--highlight-line diag)
-                    (error
-                     (message "flyhigh error: %s\n diag %s"
-                              (error-message-string err)
-                              diag)))
-                  (setf (flyhigh--diag-backend diag) backend))
-                new-diags)
-          (setf (flyhigh--backend-state-diags state)
-                (append new-diags (flyhigh--backend-state-diags state)))
-          (when flyhigh-check-start-time
-            (flyhigh-log :debug "backend %s reported %d diagnostics in %.2f second(s)"
-                         backend
-                         (length new-diags)
-                         (- (float-time) flyhigh-check-start-time)))
-          (when (and (get-buffer (flyhigh--diagnostics-buffer-name))
-                     (get-buffer-window (flyhigh--diagnostics-buffer-name))
-                     (null (cl-set-difference (flyhigh-running-backends)
-                                              (flyhigh-reporting-backends))))
-            (flyhigh-show-diagnostics-buffer))))))))
+    (deferred:nextc it
+      (lambda (_)
+        (cl-loop with ws = (window-start)
+                 with we = (window-end)
+                 for diag in new-diags
+                 for beg = (flyhigh--diag-beg diag)
+                 for end = (flyhigh--diag-end diag)
+                 if (and (<= ws beg) (<= end we))
+                 collect diag into visible-hl
+                 else collect diag into invisible-hl
+                 finally return (cons visible-hl invisible-hl))))
+
+    (deferred:nextc it
+      (lambda (hl)
+        (cons (flyhigh--split-by flyhigh-division (car hl))
+              (flyhigh--split-by flyhigh-division (cdr hl)))))
+
+    (deferred:nextc it
+      (lambda (hl)
+        (flyhigh--deferred-hls (car hl) backend state)
+        (cdr hl)))
+
+    (deferred:nextc it
+      (lambda (invisible-hl)
+        (deferred:$
+          (deferred:wait-idle 1000)
+          (deferred:nextc it
+            (lambda (_time)
+              (flyhigh--deferred-hls invisible-hl backend state))))))
+
+    (deferred:nextc it
+      (lambda (_)
+        (when flyhigh-check-start-time
+          (flyhigh-log :debug "backend %s reported %d diagnostics in %.2f second(s)"
+                       backend
+                       (length new-diags)
+                       (- (float-time) flyhigh-check-start-time)))
+        (when (and (get-buffer (flyhigh--diagnostics-buffer-name))
+                   (get-buffer-window (flyhigh--diagnostics-buffer-name))
+                   (null (cl-set-difference (flyhigh-running-backends)
+                                            (flyhigh-reporting-backends))))
+          (flyhigh-show-diagnostics-buffer))))))
+
+(defun flyhigh--deferred-hls (highlight backend state)
+  "HIGHLIGHT lines with deferred for BACKEND and STATE."
+  (apply
+   `((lambda ()
+       (deferred:$
+         ,@(mapcar
+            (lambda (hl)
+              (deferred:next
+                (lambda (hl) (flyhigh--deferred-hl-lines hl backend state))
+                hl))
+            highlight))))))
+
+(defun flyhigh--split-by (num hl)
+  ""
+  (cl-loop for i from 0 to (length hl) by num
+           for x = (-take num hl) then (-take num (nthcdr (1+ i) hl))
+           if x collect x))
+
+(defun flyhigh--deferred-hl-lines (highlight backend state)
+  ""
+  (deferred:$
+    ;; I'm not sure what is the right value for this...
+    (deferred:wait-idle flyhigh-highlight-interval) ; msec
+    (deferred:next
+      (lambda (hl)
+        (flyhigh--apply-highlight-lines hl backend state))
+      highlight)))
+
+(defun flyhigh--apply-highlight-lines (diags backend state)
+  ""
+  (when diags
+    (save-restriction
+      (widen)
+      (mapc (lambda (diag) (flyhigh--apply-highlight-line diag backend))
+            diags))
+    (setf (flyhigh--backend-state-diags state)
+          (append diags (flyhigh--backend-state-diags state)))))
+
+(defun flyhigh--apply-highlight-line (diag backend)
+  ""
+  (condition-case err
+      (flyhigh--highlight-line diag)
+    (error
+     (message "flyhigh error: %s\n diag %s"
+              (error-message-string err)
+              diag)))
+  (setf (flyhigh--diag-backend diag) backend))
 
 (defun flyhigh-make-report-fn (backend &optional token)
   "Make a suitable anonymous report function for BACKEND.
@@ -681,9 +775,8 @@ Do it only if `flyhigh-no-changes-timeout' is non-nil."
   "Add a timer to re-dispaly for cursor move."
   (let ((sline (flyhigh--line (window-start)))
         (eline (flyhigh--line (window-end))))
-    (when (and flyhigh-mode
-               (not (and (<= (car flyhigh-window-bounds) sline)
-                         (>= (cdr flyhigh-window-bounds) eline))))
+    (when (not (and (<= (car flyhigh-window-bounds) sline)
+                    (>= (cdr flyhigh-window-bounds) eline)))
       (flyhigh--schedule-timer-maybe))))
 
 (defun flyhigh-after-save-hook ()
@@ -801,18 +894,6 @@ POS can be a buffer position or a button"
       (revert-buffer)
       (display-buffer (current-buffer)))))
 
-(defun flyhigh-log2 ()
-  ""
-  (interactive)
-  (nimsuggest--call-epc
-   'highlight
-   (lambda (highlights)
-     (when highlights
-       (cl-loop for (_ sk _ file _ line col _ _) in highlights
-                if (eq (get-file-buffer file) (current-buffer))
-                do (message "hi: %s line: %d column: %d" sk line col))))))
-
-;; (define-key nimsuggest-mode-map (kbd "C-9") 'flyhigh-log2)
 
 (provide 'flyhigh)
 

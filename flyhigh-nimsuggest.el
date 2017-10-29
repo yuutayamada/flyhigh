@@ -27,40 +27,77 @@
 
 (require 'flyhigh)
 (require 'nim-mode)
+(require 'nim-suggest)
 
 ;;;###autoload
 (when (version<= "26" (number-to-string emacs-major-version))
   (add-hook 'nimsuggest-mode-hook 'flyhigh-nimsuggest-setup)
   (add-hook 'prog-mode-hook 'flyhigh-mode))
 
+
+(defmacro nimsuggest-high-face (name inherit)
+  `(defface ,name
+     '((t (:inherit ,inherit)))
+     ,(format "Font Lock face for %s." (symbol-name name))
+     :group 'nim))
+
+(nimsuggest-high-face nim-unknown-face font-lock-preprocessor-face)
+(nimsuggest-high-face nim-conditional-face font-lock-preprocessor-face)
+
+(nimsuggest-high-face nim-param-face font-lock-function-name-face)
+(nimsuggest-high-face nim-generic-param-face font-lock-function-name-face)
+(nimsuggest-high-face nim-let-face font-lock-variable-name-face)
+(nimsuggest-high-face nim-module-face font-lock-function-name-face)
+
+(nimsuggest-high-face nim-proc-face font-lock-function-name-face)
+(nimsuggest-high-face nim-func-face font-lock-function-name-face)
+(nimsuggest-high-face nim-method-face font-lock-function-name-face)
+(nimsuggest-high-face nim-iterator-face font-lock-function-name-face)
+(nimsuggest-high-face nim-converter-face font-lock-function-name-face)
+(nimsuggest-high-face nim-macro-face font-lock-function-name-face)
+(nimsuggest-high-face nim-template-face font-lock-function-name-face)
+(nimsuggest-high-face nim-field-face font-lock-builtin-face)
+(nimsuggest-high-face nim-enum-face font-lock-builtin-face)
+(nimsuggest-high-face nim-forvar-face font-lock-builtin-face)
+(nimsuggest-high-face nim-label-face font-lock-builtin-face)
+(nimsuggest-high-face nim-stub-face font-lock-builtin-face)
+(nimsuggest-high-face nim-package-face font-lock-builtin-face)
+(nimsuggest-high-face nim-alias-face font-lock-builtin-face)
+
 (defconst nimsuggest-symkinds
   ;; From ast.nim, some of them aren't used as completion maybe...
-  '((skUnknown      . 'error)
-    (skConditional  . 'error)
-    (skDynLib       . 'error);
-    (skParam        . font-lock-type-face)
-    (skGenericParam . font-lock-type-face)
-    (skTemp         . font-lock-type-face)
-    (skModule       . font-lock-type-face)
-    (skType         . font-lock-type-face)
-    (skVar          . font-lock-variable-name-face)
-    (skLet          . font-lock-variable-name-face)
-    (skConst        . font-lock-constant-face)
-    (skResult       . font-lock-variable-name-face)
-    (skProc         . font-lock-function-name-face)
-    (skFunc         . font-lock-function-name-face)
-    (skMethod       . font-lock-function-name-face)
-    (skIterator     . font-lock-function-name-face)
-    (skConverter    . font-lock-function-name-face)
-    (skMacro        . font-lock-function-name-face)
-    (skTemplate     . font-lock-function-name-face);
-    (skField        . font-lock-builtin-face)
-    (skEnumField    . font-lock-builtin-face)
-    (skForVar       . font-lock-builtin-face)
-    (skLabel        . font-lock-builtin-face)
-    (skStub         . font-lock-builtin-face);
-    (skPackage      . font-lock-builtin-face)
-    (skAlias        . font-lock-builtin-face)))
+  '((skUnknown      . nim-unknown-face)
+    ;; unknown symbol: used for parsing assembler blocks
+    ;; and first phase symbol lookup in generics
+    (skConditional  . nim-conditional-face)
+    ;; symbol for the preprocessor (may become obsolete)
+    (skDynLib       . error);
+    ;; symbol represents a dynamic library; this is used
+    ;; internally; it does not exist in Nim code
+    (skParam        . nim-param-face) ; a parameter
+    (skGenericParam . nim-generic-param-face) ; a generic parameter; eq in ``proc x[eq=`==`]()``
+    (skTemp         . font-lock-type-face) ; a temporary variable (introduced by compiler)
+    (skModule       . nim-module-face) ; module identifier
+    (skType         . font-lock-type-face) ; a type
+    (skVar          . font-lock-variable-name-face) ; a variable
+    (skLet          . nim-let-face) ; a 'let' symbol
+    (skConst        . font-lock-constant-face)      ; a constant
+    (skResult       . font-lock-variable-name-face) ; special 'result' variable
+    (skProc         . nim-proc-face) ; a proc
+    (skFunc         . nim-func-face) ; a func
+    (skMethod       . nim-method-face) ; a method
+    (skIterator     . nim-iterator-face) ; an iterator
+    (skConverter    . nim-convertor-face) ; a converter
+    (skMacro        . nim-macro-face) ; a macro
+    (skTemplate     . nim-template-face) ; a template
+    (skField        . nim-field-face) ;  a field in a record or object
+    (skEnumField    . nim-enum-face) ; an identifier in an enum
+    (skForVar       . nim-forvar-face) ; a for loop variable
+    (skLabel        . nim-label-face) ; a label (for block statement)
+    (skStub         . nim-stub-face);; symbol is a stub and not yet loaded from the ROD file
+    (skPackage      . nim-package-face) ; symbol is a package (used for canonicalization)
+    (skAlias        . nim-alias-face) ; an alias (needs to be resolved immediately)
+    ))
 
 (defun nimsuggest--flyhigh-get-face (hint)
   ""
@@ -76,10 +113,6 @@
       (add-hook  'flyhigh-diagnostic-functions 'flyhigh-nimsuggest nil t)
     (remove-hook 'flyhigh-diagnostic-functions 'flyhigh-nimsuggest t)))
 
-(defun flyhigh--visible-end ()
-  ""
-  (- (window-end) (window-start)))
-
 (defun flyhigh--nimsuggest-region (buf line col)
   "Calculate beg and end for FILE, BUF, LINE, and COL.
 Workaround for https://github.com/nim-lang/nim-mode/issues/183."
@@ -92,18 +125,17 @@ Workaround for https://github.com/nim-lang/nim-mode/issues/183."
         (forward-char col)
         (bounds-of-thing-at-point 'symbol)))))
 
-(defun flyhigh--nimsuggest-filter (highlights buffer)
-  ""
-  (cl-loop with (sl . el) = (flyhigh--offset (flyhigh--line (window-start))
-                                             (flyhigh--line (window-end)))
-           for (_ sk _ file _ line col _ _) in highlights
-
+(defun flyhigh--nimsuggest-filter (highlight buffer)
+  "Return highlight candidates from HIGHLIGHT on the BUFFER.
+Unnecessary lines will be removed (outside of
+`flyhigh-window-bounds-with-offset')."
+  (cl-loop with (sl . el) = (flyhigh-window-bounds-with-offset)
+           for (_ sk _ file _ line col _ _) in highlight
            if (and (<= sl line) (<= line el)
                    (eq (get-file-buffer file) buffer))
            collect (list line col (nimsuggest--flyhigh-get-face sk))))
 
-(require 'deferred)
-(defun flyhigh-nimsuggest* (highlight buffer report-fn)
+(defun flyhigh-nimsuggest-core (highlight buffer report-fn)
   ""
   (deferred:$
     (deferred:next
@@ -111,9 +143,9 @@ Workaround for https://github.com/nim-lang/nim-mode/issues/183."
         (nim-log "flyhigh started: %d" (length highlight))
         (flyhigh--nimsuggest-filter highlight buffer)))
     (deferred:nextc it
-      (lambda (hs)
-        (nim-log "flyhigh parsing hs: %d" (length hs))
-        (cl-loop for (line col face) in hs
+      (lambda (line-based-hs)
+        (nim-log "flyhigh parsing hs: %d" (length line-based-hs))
+        (cl-loop for (line col face) in line-based-hs
                  for (beg . end) = (flyhigh--nimsuggest-region buffer line col)
                  if (and beg end) ; TODO
                  collect (list buffer beg end face))))
@@ -128,16 +160,16 @@ Workaround for https://github.com/nim-lang/nim-mode/issues/183."
         (funcall report-fn report-action)))
     (deferred:error it
       (lambda (err)
-        (nim-log "Wrong input : %s" err)))))
+        (nim-log "flyhigh something wrong: %s" err)))))
 
 (defun flyhigh-nimsuggest (report-fn &rest _args)
-  "A Flymake backend for Nim language using Flyhigh.
-See `flymake-diagnostic-functions' for REPORT-FN and ARGS."
+  "A Flyhigh backend for Nim language using Flyhigh.
+See `flyhigh-diagnostic-functions' for REPORT-FN and ARGS."
   (let ((buffer (current-buffer)))
     (nimsuggest--call-epc
      'highlight
      (lambda (highlight)
-       (flyhigh-nimsuggest* highlight buffer report-fn)))))
+       (flyhigh-nimsuggest-core highlight buffer report-fn)))))
 
 (provide 'flyhigh-nimsuggest)
 ;;; flyhigh-nimsuggest.el ends here
