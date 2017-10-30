@@ -78,7 +78,7 @@ If nil, never start checking buffer automatically like this."
   "Time to idle wait for group of highlight by msec."
   :type 'number)
 
-(defcustom flyhigh-offset 50
+(defcustom flyhigh-offset 0
   "Line offset; increase offset more highlight more display lock..."
   :type 'number)
 
@@ -431,12 +431,11 @@ not expected."
                  if (and (<= ws beg) (<= end we))
                  collect diag into visible-hl
                  else collect diag into invisible-hl
-                 finally return (cons visible-hl invisible-hl))))
+                 finally return (append visible-hl invisible-hl))))
 
     (deferred:nextc it
-      (lambda (hl)
-        (append (flyhigh--split-by flyhigh-division (car hl))
-                (flyhigh--split-by flyhigh-division (cdr hl)))))
+      (lambda (highlight)
+        (flyhigh--split-by flyhigh-division highlight)))
 
     (deferred:nextc it
       (deferred:lambda (hl)
