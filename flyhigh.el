@@ -65,7 +65,7 @@
   "Start syntax check if newline char was added/removed from the buffer."
   :type 'boolean)
 
-(defcustom flyhigh-no-changes-timeout 0.6
+(defcustom flyhigh-no-changes-timeout 0.5
   "Time to wait after last change before automatically checking buffer.
 If nil, never start checking buffer automatically like this."
   :type 'number)
@@ -78,7 +78,7 @@ If nil, never start checking buffer automatically like this."
   "Time to idle wait for group of highlight by msec."
   :type 'number)
 
-(defcustom flyhigh-offset 0
+(defcustom flyhigh-offset 50
   "Line offset; increase offset more highlight more display lock..."
   :type 'number)
 
@@ -435,21 +435,19 @@ not expected."
 
     (deferred:nextc it
       (lambda (hl)
-        (cons (flyhigh--split-by flyhigh-division (car hl))
-              (flyhigh--split-by flyhigh-division (cdr hl)))))
+        (append (flyhigh--split-by flyhigh-division (car hl))
+                (flyhigh--split-by flyhigh-division (cdr hl)))))
 
     (deferred:nextc it
-      (lambda (hl)
-        (flyhigh--deferred-hls (car hl) backend state)
-        (cdr hl)))
-
-    (deferred:nextc it
-      (lambda (invisible-hl)
-        (deferred:$
-          (deferred:wait-idle 1000)
-          (deferred:nextc it
-            (lambda (_time)
-              (flyhigh--deferred-hls invisible-hl backend state))))))
+      (deferred:lambda (hl)
+        (flyhigh--apply-highlight-lines (car hl) backend state)
+        (when hl
+          (setf hl (cdr hl))
+          (deferred:nextc
+            (deferred:$
+              (deferred:wait-idle flyhigh-highlight-interval)
+              (deferred:nextc it (lambda (_) hl)))
+            self))))
 
     (deferred:nextc it
       (lambda (_)
@@ -464,33 +462,11 @@ not expected."
                                             (flyhigh-reporting-backends))))
           (flyhigh-show-diagnostics-buffer))))))
 
-(defun flyhigh--deferred-hls (highlight backend state)
-  "HIGHLIGHT lines with deferred for BACKEND and STATE."
-  (apply
-   `((lambda ()
-       (deferred:$
-         ,@(mapcar
-            (lambda (hl)
-              (deferred:next
-                (lambda (hl) (flyhigh--deferred-hl-lines hl backend state))
-                hl))
-            highlight))))))
-
 (defun flyhigh--split-by (num hl)
-  ""
+  "Split HL of highlight by NUM."
   (cl-loop for i from 0 to (length hl) by num
            for x = (-take num hl) then (-take num (nthcdr (1+ i) hl))
            if x collect x))
-
-(defun flyhigh--deferred-hl-lines (highlight backend state)
-  ""
-  (deferred:$
-    ;; I'm not sure what is the right value for this...
-    (deferred:wait-idle flyhigh-highlight-interval) ; msec
-    (deferred:next
-      (lambda (hl)
-        (flyhigh--apply-highlight-lines hl backend state))
-      highlight)))
 
 (defun flyhigh--apply-highlight-lines (diags backend state)
   ""
