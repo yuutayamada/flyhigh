@@ -66,7 +66,7 @@
   "Start syntax check if newline char was added/removed from the buffer."
   :type 'boolean)
 
-(defcustom flyhigh-no-changes-timeout 0.5
+(defcustom flyhigh-no-changes-timeout 10 ; sec
   "Time to wait after last change before automatically checking buffer.
 If nil, never start checking buffer automatically like this."
   :type 'number)
