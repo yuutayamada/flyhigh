@@ -46,6 +46,7 @@
 ;; * cache the un-finished highlight and doesn't make a query if you
 ;;   already have the highlight when user doesn't changed anything,
 ;;   but cursor moved.
+
 ;;; Code:
 
 (require 'cl-lib)
@@ -402,41 +403,48 @@ not expected."
         (flyhigh--disable-backend backend
                                   (format "Unknown action %S" report-action))
         (flyhigh-error "Expected report, but got unknown key %s" report-action))
-       (t (flyhigh--handle-report-1 report-action first-report backend state))))))
+       (t
+        (if (and first-report
+                 (buffer-modified-p (current-buffer)))
+            (flyhigh--handle-report-1 report-action t backend state)
+          (flyhigh--handle-report-1 report-action nil backend state t)))))))
 
-(defun flyhigh--handle-report-1 (new-diags first-report backend state)
+(defun flyhigh--handle-report-1 (new-hl flush backend state &optional reuse-ov)
   ""
   ;; Trying to make pseudo async handler using `deferred' package.
   (deferred:$
-    ;; TODO: remove some overlays from `new-diags' that already
+    ;; TODO: remove some overlays from `new-hl' that already
     ;; highlighted.
     (deferred:next
-      ;; only delete overlays if this is the first report
+      ;; TODO: document what it does
       (lambda ()
-        (when first-report
+        (when flush
           (save-restriction
             (widen)
-            (flyhigh-delete-own-overlays
-             (lambda (ov)
-               (eq backend
-                   (flyhigh--diag-backend
-                    (overlay-get ov 'flyhigh-diagnostic)))))))))
+            (let ((ws (window-start))
+                  (we (window-end)))
+              (flyhigh-delete-own-overlays
+               (lambda (ov)
+                 (and
+                  (<= ws (overlay-start ov) (overlay-end ov) we)
+                  (eq backend
+                      (flyhigh--diag-backend
+                       (overlay-get ov 'flyhigh-diagnostic)))))))))))
 
     (deferred:nextc it
       (lambda (_)
-        (cl-loop with ws = (window-start)
-                 with we = (window-end)
-                 for diag in new-diags
-                 for beg = (flyhigh--diag-beg diag)
-                 for end = (flyhigh--diag-end diag)
-                 if (and (<= ws beg) (<= end we))
-                 collect diag into visible-hl
-                 else collect diag into invisible-hl
-                 finally return (append visible-hl invisible-hl))))
+        (if (not reuse-ov)
+            new-hl
+          (cl-remove-if
+           (lambda (diag) (member diag (flyhigh--backend-state-diags state)))
+           new-hl))))
 
     (deferred:nextc it
-      (lambda (highlight)
-        (flyhigh--split-by flyhigh-division highlight)))
+      (lambda (hl) (flyhigh--sort-by-visible hl)))
+
+    (deferred:nextc it
+      (lambda (hl)
+        (flyhigh--split-by flyhigh-division hl)))
 
     (deferred:nextc it
       (deferred:lambda (hl)
@@ -454,13 +462,26 @@ not expected."
         (when flyhigh-check-start-time
           (flyhigh-log :debug "backend %s reported %d diagnostics in %.2f second(s)"
                        backend
-                       (length new-diags)
+                       (length new-hl)
                        (- (float-time) flyhigh-check-start-time)))
         (when (and (get-buffer (flyhigh--diagnostics-buffer-name))
                    (get-buffer-window (flyhigh--diagnostics-buffer-name))
                    (null (cl-set-difference (flyhigh-running-backends)
                                             (flyhigh-reporting-backends))))
           (flyhigh-show-diagnostics-buffer))))))
+
+(defun flyhigh--sort-by-visible (diags)
+  "Return curated DIAGS.
+Visible is fast, invisible is later."
+  (cl-loop with ws = (window-start)
+           with we = (window-end)
+           for diag in diags
+           for beg = (flyhigh--diag-beg diag)
+           for end = (flyhigh--diag-end diag)
+           if (<= ws beg end we)
+           collect diag into visible-hl
+           else collect diag into invisible-hl
+           finally return (append visible-hl invisible-hl)))
 
 (defun flyhigh--split-by (num hl)
   "Split HL of highlight by NUM."
