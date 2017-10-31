@@ -61,7 +61,8 @@
   "Universal on-the-fly syntax highlighter."
   :group 'tools)
 
-(defcustom flyhigh-start-syntax-highlight-on-newline t
+;; Probably we don't need this
+(defcustom flyhigh-start-syntax-highlight-on-newline nil
   "Start syntax check if newline char was added/removed from the buffer."
   :type 'boolean)
 
