@@ -352,7 +352,7 @@ backend is operating normally.")
 
 (cl-defstruct (flyhigh--backend-state
                (:constructor flyhigh--make-backend-state))
-  running reported-p disabled diags)
+  running reported-p disabled diags immediate-diags lock)
 
 (defmacro flyhigh--with-backend-state (backend state-var &rest body)
   "Bind BACKEND's STATE-VAR to its state, run BODY."
@@ -404,71 +404,97 @@ not expected."
                                   (format "Unknown action %S" report-action))
         (flyhigh-error "Expected report, but got unknown key %s" report-action))
        (t
-        (if (and first-report
-                 (buffer-modified-p (current-buffer)))
-            (flyhigh--handle-report-1 report-action t backend state)
-          (flyhigh--handle-report-1 report-action nil backend state t)))))))
+        (cond
+         ((flyhigh--backend-state-lock state)
+          (setf (flyhigh--backend-state-immediate-diags state)
+                report-action))
+         ((and first-report
+               (buffer-modified-p (current-buffer)))
+          (flyhigh--handle-report-1 report-action t backend state))
+         (t
+          (flyhigh--handle-report-1 report-action nil backend state t))))))))
 
+
+;; Core logic
 (defun flyhigh--handle-report-1 (new-hl flush backend state &optional reuse-ov)
   ""
-  ;; Trying to make pseudo async handler using `deferred' package.
+  ;; 1. Flush if required
+  ;; 2. Check if there are re-usable OVs
+  ;; 3. Sort by visible highlight
+  ;; 4. Split highlight, so later you can handle overlays partially
+  ;;    Also, first visible parts are passed whole highlight once, so
+  ;;    you don't need to see needless buffer re-display.
+  ;; 5. Put overlays asynchronously
+  ;;    - when flyhigh gets interrupt during highlighting, it priors,
+  ;;      `flyhigh--backend-state-immediate-diags' and discard
+  ;;      previous task.
   (deferred:$
-    ;; TODO: remove some overlays from `new-hl' that already
-    ;; highlighted.
+    ;; (0)
     (deferred:next
-      ;; TODO: document what it does
       (lambda ()
+        (setf (flyhigh--backend-state-lock state) t)))
+
+    ;; (1)
+    (deferred:nextc it
+      ;; TODO: document what it does
+      (lambda (_)
         (when flush
           (save-restriction
             (widen)
             (let ((ws (window-start))
                   (we (window-end)))
-              (flyhigh-delete-own-overlays
-               (lambda (ov)
-                 (and
-                  (<= ws (overlay-start ov) (overlay-end ov) we)
-                  (eq backend
-                      (flyhigh--diag-backend
-                       (overlay-get ov 'flyhigh-diagnostic)))))))))))
+              (mapc #'delete-overlay
+                    (flyhigh--overlays
+                     :beg ws :end we
+                     :filter
+                     (lambda (ov)
+                       (eq backend
+                           (flyhigh--diag-backend
+                            (overlay-get ov 'flyhigh-diagnostic)))))))))))
 
+    ;; (2)
     (deferred:nextc it
       (lambda (_)
-        (if (not reuse-ov)
-            new-hl
-          (cl-remove-if
-           (lambda (diag) (member diag (flyhigh--backend-state-diags state)))
-           new-hl))))
+        (flyhigh--reuse-ov reuse-ov new-hl state)))
 
-    (deferred:nextc it
-      (lambda (hl) (flyhigh--sort-by-visible hl)))
-
+    ;; (3)
     (deferred:nextc it
       (lambda (hl)
-        (flyhigh--split-by flyhigh-division hl)))
+        (flyhigh--sort-by-visible hl))) ; -> (visible . invisible)
 
+    ;; (4)
+    (deferred:nextc it
+      (lambda (hl)
+        (append (list (car hl))
+                (flyhigh--split-by flyhigh-division (cdr hl)))))
+
+    ;; (5)
     (deferred:nextc it
       (deferred:lambda (hl)
-        (flyhigh--apply-highlight-lines (car hl) backend state)
-        (when hl
-          (setf hl (cdr hl))
-          (deferred:nextc
-            (deferred:$
-              (deferred:wait-idle flyhigh-highlight-interval)
-              (deferred:nextc it (lambda (_) hl)))
-            self))))
+        (if-let* ((idiags (flyhigh--get-immediate-diags state)))
+            (flyhigh--apply-highlight-lines idiags backend state)
+          (flyhigh--apply-highlight-lines (car hl) backend state)
+          (when hl
+            (setf hl (cdr hl))
+           (deferred:nextc
+             (deferred:$
+               (deferred:wait-idle flyhigh-highlight-interval)
+               (deferred:nextc it (lambda (_) hl)))
+             self)))))
 
     (deferred:nextc it
       (lambda (_)
+        (setf (flyhigh--backend-state-lock state) nil)
         (when flyhigh-check-start-time
           (flyhigh-log :debug "backend %s reported %d diagnostics in %.2f second(s)"
                        backend
                        (length new-hl)
-                       (- (float-time) flyhigh-check-start-time)))
-        (when (and (get-buffer (flyhigh--diagnostics-buffer-name))
-                   (get-buffer-window (flyhigh--diagnostics-buffer-name))
-                   (null (cl-set-difference (flyhigh-running-backends)
-                                            (flyhigh-reporting-backends))))
-          (flyhigh-show-diagnostics-buffer))))))
+                       (- (float-time) flyhigh-check-start-time)))))
+
+    (deferred:error it
+      (lambda (err)
+        (setf (flyhigh--backend-state-lock state) nil)
+        (flyhigh-log :error "err: %s" err)))))
 
 (defun flyhigh--sort-by-visible (diags)
   "Return curated DIAGS.
@@ -481,7 +507,7 @@ Visible is fast, invisible is later."
            if (<= ws beg end we)
            collect diag into visible-hl
            else collect diag into invisible-hl
-           finally return (append visible-hl invisible-hl)))
+           finally return (cons visible-hl invisible-hl)))
 
 (defun flyhigh--split-by (num hl)
   "Split HL of highlight by NUM."
@@ -508,6 +534,19 @@ Visible is fast, invisible is later."
               (error-message-string err)
               diag)))
   (setf (flyhigh--diag-backend diag) backend))
+
+(defun flyhigh--reuse-ov (reuse-ov new-hl state)
+  ""
+  (if (not reuse-ov)
+      new-hl
+    (cl-remove-if
+     (lambda (diag) (member diag (flyhigh--backend-state-diags state)))
+     new-hl)))
+
+(defun flyhigh--get-immediate-diags (state)
+  ""
+  (when-let* ((idiags (flyhigh--backend-state-immediate-diags state)))
+    (flyhigh--reuse-ov t idiags state)))
 
 (defun flyhigh-make-report-fn (backend &optional token)
   "Make a suitable anonymous report function for BACKEND.
@@ -719,24 +758,24 @@ special *Flyhigh log* buffer."  :group 'flyhigh :lighter
       (cancel-timer flyhigh-timer)
       (setq flyhigh-timer nil)))))
 
-(defun flyhigh--schedule-timer-maybe ()
+(defun flyhigh--schedule-timer-maybe (&optional delay)
   "(Re)schedule an idle timer for checking the buffer.
 Do it only if `flyhigh-no-changes-timeout' is non-nil."
   (when flyhigh-timer (cancel-timer flyhigh-timer))
-  (when flyhigh-no-changes-timeout
+  (when-let* ((d (or delay flyhigh-no-changes-timeout)))
     (setq
      flyhigh-timer
      (run-with-idle-timer
-      (seconds-to-time flyhigh-no-changes-timeout)
+      (seconds-to-time d)
       nil
       (lambda (buffer)
         (when (buffer-live-p buffer)
           (with-current-buffer buffer
             (when (and flyhigh-mode
-                       flyhigh-no-changes-timeout)
+                       d)
         (flyhigh-log
                :debug "starting syntax check after idle for %s seconds"
-               flyhigh-no-changes-timeout)
+               d)
         (flyhigh-start t))
             (setq flyhigh-timer nil))))
       (current-buffer)))))
@@ -774,7 +813,7 @@ Do it only if `flyhigh-no-changes-timeout' is non-nil."
         (eline (flyhigh--line (window-end))))
     (when (not (and (<= (car flyhigh-window-bounds) sline)
                     (>= (cdr flyhigh-window-bounds) eline)))
-      (flyhigh--schedule-timer-maybe))))
+      (flyhigh--schedule-timer-maybe 0.3))))
 
 (defun flyhigh-after-save-hook ()
   (when flyhigh-mode
