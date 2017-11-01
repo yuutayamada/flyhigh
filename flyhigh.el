@@ -76,7 +76,11 @@ If nil, never start checking buffer automatically like this."
   "Time to idle wait for invisible highlight by msec."
   :type 'number)
 
-(defcustom flyhigh-highlight-interval 10
+(defcustom flyhigh-highlight-interval 2000
+  "Time to idle wait for group of highlight by msec."
+  :type 'number)
+
+(defcustom flyhigh-highlight-idle-interval 2000
   "Time to idle wait for group of highlight by msec."
   :type 'number)
 
@@ -352,7 +356,8 @@ backend is operating normally.")
 
 (cl-defstruct (flyhigh--backend-state
                (:constructor flyhigh--make-backend-state))
-  running reported-p disabled diags immediate-diags lock)
+  running reported-p disabled diags immediate-diags lock
+  rest-hl rest-handler complete)
 
 (defmacro flyhigh--with-backend-state (backend state-var &rest body)
   "Bind BACKEND's STATE-VAR to its state, run BODY."
@@ -371,6 +376,7 @@ backend is operating normally.")
 
 (cl-defun flyhigh--handle-report (backend token report-action
                                           &key explanation force
+                                          rest rest-handler buffer
                                           &allow-other-keys)
   "Handle reports from BACKEND identified by TOKEN.
 BACKEND, REPORT-ACTION and EXPLANATION, and FORCE conform to the calling
@@ -403,20 +409,30 @@ not expected."
         (flyhigh--disable-backend backend
                                   (format "Unknown action %S" report-action))
         (flyhigh-error "Expected report, but got unknown key %s" report-action))
+       ((and (eq (flyhigh--backend-state-complete state) t)
+             (not (buffer-modified-p (current-buffer))))
+        nil)
+       ((not (eq (current-buffer) buffer))
+        (flyhigh-error "Unexpected buffer %s against %s" (current-buffer) buffer))
        (t
+        (setf (flyhigh--backend-state-complete state) nil)
+        (when rest
+          (setf (flyhigh--backend-state-rest-hl state) rest)
+          (setf (flyhigh--backend-state-rest-handler state) rest-handler))
         (cond
          ((flyhigh--backend-state-lock state)
           (setf (flyhigh--backend-state-immediate-diags state)
                 report-action))
          ((and first-report
                (buffer-modified-p (current-buffer)))
-          (flyhigh--handle-report-1 report-action t backend state))
+          (flyhigh--handle-report-1 report-action t backend state nil buffer))
          (t
-          (flyhigh--handle-report-1 report-action nil backend state t))))))))
+          (flyhigh--handle-report-1 report-action nil backend state t buffer))))))))
 
 
 ;; Core logic
-(defun flyhigh--handle-report-1 (new-hl flush backend state &optional reuse-ov)
+(defun flyhigh--handle-report-1 (new-hl flush backend state
+                                        &optional reuse-ov buffer)
   ""
   ;; 1. Flush if required
   ;; 2. Check if there are re-usable OVs
@@ -471,16 +487,31 @@ not expected."
     ;; (5)
     (deferred:nextc it
       (deferred:lambda (hl)
-        (if-let* ((idiags (flyhigh--get-immediate-diags state)))
-            (flyhigh--apply-highlight-lines idiags backend state)
-          (flyhigh--apply-highlight-lines (car hl) backend state)
-          (when hl
-            (setf hl (cdr hl))
-           (deferred:nextc
-             (deferred:$
-               (deferred:wait-idle flyhigh-highlight-interval)
-               (deferred:nextc it (lambda (_) hl)))
-             self)))))
+        (if (not (flyhihg--work-ok-p buffer))
+            (flyhigh--cancel it state)
+          (let ((interrupt (flyhigh--get-immediate-diags state)))
+            (if interrupt
+                (flyhigh--apply-highlight-lines interrupt backend state)
+              (flyhigh--apply-highlight-lines (car hl) backend state))
+
+            ;; Set idle jobs
+            ;; TODO: write API document
+            (when-let* ((untouched-highlilght
+                         (and (null hl) (flyhigh--backend-state-rest-hl state)))
+                        (idle-jobs
+                         (funcall (flyhigh--backend-state-rest-handler state)
+                                  untouched-highlilght state buffer)))
+              (setf (flyhigh--backend-state-complete state) 'idle)
+              (setq hl (flyhigh--split-by flyhigh-division idle-jobs)))
+
+            (message "rest is %d / %d \ncar hl %s" (length hl)
+                     (length (flyhigh--backend-state-rest-hl state))
+                     (car hl))
+            ;; work until no jobs
+            (if (null hl)
+                (setf (flyhigh--backend-state-complete state) t)
+              (unless interrupt (setf hl (cdr hl)))
+              (flyhigh--recur self hl state))))))
 
     (deferred:nextc it
       (lambda (_)
@@ -495,6 +526,27 @@ not expected."
       (lambda (err)
         (setf (flyhigh--backend-state-lock state) nil)
         (flyhigh-log :error "err: %s" err)))))
+
+(defun flyhigh--recur (self hl state)
+  ""
+  (deferred:nextc
+    (deferred:$
+      (deferred:wait-idle
+        (if (eq 'idle (flyhigh--backend-state-complete state))
+            flyhigh-highlight-idle-interval
+          flyhigh-highlight-interval))
+      (deferred:nextc it (lambda (_) hl)))
+    self))
+
+(defun flyhigh--cancel (d state)
+  ""
+  (setf (flyhigh--backend-state-lock state) nil)
+  (deferred-cancel d))
+
+(defun flyhihg--work-ok-p (buf)
+  ""
+  (and (eq (current-buffer) buf)
+       (bound-and-true-p flyhigh-mode)))
 
 (defun flyhigh--sort-by-visible (diags)
   "Return curated DIAGS.
@@ -628,6 +680,17 @@ If it is running also stop it."
       (error
        (flyhigh--disable-backend backend err)))))
 
+(defun flyhigh-update-window-bounds ()
+  "Return t if current cursor point is inside visible window."
+  (when (or (null flyhigh-window-bounds)
+            (not (<= (car flyhigh-window-bounds)
+                     (line-number-at-pos (point) 'absolute)
+                     (cdr flyhigh-window-bounds))))
+    (setq-local flyhigh-window-bounds
+                (flyhigh--offset (flyhigh--line (window-start))
+                                 (flyhigh--line (window-end))))
+    t))
+
 (defun flyhigh-start (&optional deferred force)
   "Start a syntax check for the current buffer.
 DEFERRED is a list of symbols designating conditions to wait for
@@ -642,10 +705,7 @@ With optional FORCE run even disabled backends.
 
 Interactively, with a prefix arg, FORCE is t."
   (interactive (list nil current-prefix-arg))
-
-  (setq-local flyhigh-window-bounds
-              (flyhigh--offset (flyhigh--line (window-start))
-                               (flyhigh--line (window-end))))
+  (flyhigh-update-window-bounds)
 
   (let ((deferred (if (eq t deferred)
                       '(post-command on-display)
@@ -809,11 +869,8 @@ Do it only if `flyhigh-no-changes-timeout' is non-nil."
 
 (defun flyhigh-cursor-move-hook ()
   "Add a timer to re-dispaly for cursor move."
-  (let ((sline (flyhigh--line (window-start)))
-        (eline (flyhigh--line (window-end))))
-    (when (not (and (<= (car flyhigh-window-bounds) sline)
-                    (>= (cdr flyhigh-window-bounds) eline)))
-      (flyhigh--schedule-timer-maybe 0.3))))
+  (when (flyhigh-update-window-bounds)
+    (flyhigh--schedule-timer-maybe 0.3)))
 
 (defun flyhigh-after-save-hook ()
   (when flyhigh-mode
